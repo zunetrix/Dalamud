@@ -56,7 +56,8 @@ public partial class FileDialog
 
         var wasClosed = false;
         if (!this.visible)
-        { // window closed (works whether the window was collapsed or not)
+        {
+            // window closed (works whether the window was collapsed or not)
             this.isOk = false;
             wasClosed = true;
         }
