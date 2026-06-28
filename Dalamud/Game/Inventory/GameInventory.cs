@@ -1,6 +1,7 @@
 using System.Collections;
 using System.Collections.Generic;
 using System.Linq;
+using System.Threading;
 
 using Dalamud.Game.Gui;
 using Dalamud.Game.Inventory.InventoryEventArgTypes;
@@ -18,8 +19,17 @@ namespace Dalamud.Game.Inventory;
 [ServiceManager.EarlyLoadedService]
 internal class GameInventory : IInternalDisposableService
 {
+    /// <summary>
+    /// Lists excluded InventoryTypes that are not supported by this service.
+    /// </summary>
+    internal static readonly GameInventoryType[] ExcludedInventoryTypes = [
+        GameInventoryType.Cosmopouch1,
+        GameInventoryType.Cosmopouch2
+    ];
+
     private readonly List<GameInventoryPluginScoped> subscribersPendingChange = [];
     private readonly List<GameInventoryPluginScoped> subscribers = [];
+    private readonly Lock subscribersLock = new();
 
     private readonly List<InventoryItemAddedArgs> addedEvents = [];
     private readonly List<InventoryItemRemovedArgs> removedEvents = [];
@@ -43,7 +53,7 @@ internal class GameInventory : IInternalDisposableService
     [ServiceManager.ServiceConstructor]
     private GameInventory()
     {
-        this.inventoryTypes = Enum.GetValues<GameInventoryType>();
+        this.inventoryTypes = [.. Enum.GetValues<GameInventoryType>().Where(static type => !ExcludedInventoryTypes.Contains(type))];
         this.inventoryItems = new GameInventoryItem[this.inventoryTypes.Length][];
 
         this.gameGui.AgentUpdate += this.OnAgentUpdate;
@@ -52,14 +62,13 @@ internal class GameInventory : IInternalDisposableService
     /// <inheritdoc/>
     void IInternalDisposableService.DisposeService()
     {
-        lock (this.subscribersPendingChange)
-        {
-            this.subscribers.Clear();
-            this.subscribersPendingChange.Clear();
-            this.subscribersChanged = false;
-            this.framework.Update -= this.OnFrameworkUpdate;
-            this.gameGui.AgentUpdate -= this.OnAgentUpdate;
-        }
+        using var scope = this.subscribersLock.EnterScope();
+
+        this.subscribers.Clear();
+        this.subscribersPendingChange.Clear();
+        this.subscribersChanged = false;
+        this.framework.Update -= this.OnFrameworkUpdate;
+        this.gameGui.AgentUpdate -= this.OnAgentUpdate;
     }
 
     /// <summary>
@@ -68,15 +77,15 @@ internal class GameInventory : IInternalDisposableService
     /// <param name="s">The event target.</param>
     public void Subscribe(GameInventoryPluginScoped s)
     {
-        lock (this.subscribersPendingChange)
+        using var scope = this.subscribersLock.EnterScope();
+
+        this.subscribersPendingChange.Add(s);
+        this.subscribersChanged = true;
+
+        if (this.subscribersPendingChange.Count == 1)
         {
-            this.subscribersPendingChange.Add(s);
-            this.subscribersChanged = true;
-            if (this.subscribersPendingChange.Count == 1)
-            {
-                this.inventoriesMightBeChanged = true;
-                this.framework.Update += this.OnFrameworkUpdate;
-            }
+            this.inventoriesMightBeChanged = true;
+            this.framework.Update += this.OnFrameworkUpdate;
         }
     }
 
@@ -86,14 +95,15 @@ internal class GameInventory : IInternalDisposableService
     /// <param name="s">The event target.</param>
     public void Unsubscribe(GameInventoryPluginScoped s)
     {
-        lock (this.subscribersPendingChange)
-        {
-            if (!this.subscribersPendingChange.Remove(s))
-                return;
-            this.subscribersChanged = true;
-            if (this.subscribersPendingChange.Count == 0)
-                this.framework.Update -= this.OnFrameworkUpdate;
-        }
+        using var scope = this.subscribersLock.EnterScope();
+
+        if (!this.subscribersPendingChange.Remove(s))
+            return;
+
+        this.subscribersChanged = true;
+
+        if (this.subscribersPendingChange.Count == 0)
+            this.framework.Update -= this.OnFrameworkUpdate;
     }
 
     private void OnFrameworkUpdate(IFramework framework1)
@@ -149,7 +159,8 @@ internal class GameInventory : IInternalDisposableService
         if (this.subscribersChanged)
         {
             bool isNew;
-            lock (this.subscribersPendingChange)
+
+            using (this.subscribersLock.EnterScope())
             {
                 isNew = this.subscribersPendingChange.Count != 0 && this.subscribers.Count == 0;
                 this.subscribers.Clear();

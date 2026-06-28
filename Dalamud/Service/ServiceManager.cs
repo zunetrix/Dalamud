@@ -45,6 +45,7 @@ internal static class ServiceManager
 
     [SuppressMessage("ReSharper", "CollectionNeverQueried.Local", Justification = "Debugging purposes")]
     private static readonly List<Type> LoadedServices = [];
+    private static readonly Lock LoadedServicesLock = new();
 #endif
 
     private static readonly TaskCompletionSource BlockingServicesLoadedTaskCompletionSource =
@@ -153,7 +154,7 @@ internal static class ServiceManager
         }
 
 #if DEBUG
-        lock (LoadedServices)
+        using (LoadedServicesLock.EnterScope())
         {
             ProvideAllServices();
         }
@@ -343,7 +344,7 @@ internal static class ServiceManager
 
                     // This object will be used in a task. Each task must receive a new object.
                     var startLoaderArgs = new List<object>();
-                    if (serviceType.GetCustomAttribute<BlockingEarlyLoadedServiceAttribute>() is not null)
+                    if (Attribute.IsDefined(serviceType, typeof(BlockingEarlyLoadedServiceAttribute)))
                     {
                         startLoaderArgs.Add(
                             new RegisterStartupBlockerDelegate(
@@ -375,7 +376,7 @@ internal static class ServiceManager
                     {
                         if (task.IsFaulted)
                             return;
-                        lock (LoadedServices)
+                        using (LoadedServicesLock.EnterScope())
                         {
                             LoadedServices.Add(serviceType);
                         }
@@ -516,7 +517,7 @@ internal static class ServiceManager
         }
 
 #if DEBUG
-        lock (LoadedServices)
+        using (LoadedServicesLock.EnterScope())
         {
             LoadedServices.Clear();
         }
@@ -558,7 +559,7 @@ internal static class ServiceManager
 
         if (attr.IsAssignableTo(typeof(ScopedServiceAttribute)))
         {
-            if (type.GetCustomAttribute<PluginInterfaceAttribute>() != null
+            if (Attribute.IsDefined(type, typeof(PluginInterfaceAttribute))
                 && !type.IsAssignableTo(typeof(IDalamudService)))
             {
                 Log.Error($"Plugin-scoped service {type.Name} must inherit from IDalamudService");
