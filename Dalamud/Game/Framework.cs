@@ -6,13 +6,12 @@ using System.Threading;
 using System.Threading.Tasks;
 
 using Dalamud.Configuration.Internal;
-using Dalamud.Game.Gui;
-using Dalamud.Game.Gui.Toast;
 using Dalamud.Hooking;
 using Dalamud.IoC;
 using Dalamud.IoC.Internal;
 using Dalamud.Logging.Internal;
 using Dalamud.Plugin.Internal;
+using Dalamud.Plugin.Internal.Types;
 using Dalamud.Plugin.Services;
 using Dalamud.Utility;
 
@@ -31,10 +30,8 @@ internal sealed class Framework : IInternalDisposableService, IFramework
     private static readonly Stopwatch StatsStopwatch = new();
 
     private readonly Stopwatch updateStopwatch = new();
-    private readonly HitchDetector hitchDetector;
 
     private readonly Hook<CSFramework.Delegates.Tick> updateHook;
-    private readonly Hook<CSFramework.Delegates.Destroy> destroyHook;
 
     [ServiceManager.ServiceDependency]
     private readonly GameLifecycle lifecycle = Service<GameLifecycle>.Get();
@@ -43,6 +40,7 @@ internal sealed class Framework : IInternalDisposableService, IFramework
     private readonly DalamudConfiguration configuration = Service<DalamudConfiguration>.Get();
 
     private readonly CancellationTokenSource frameworkDestroy;
+    private readonly CancellationTokenSource frameworkDestroyed;
     private readonly ThreadBoundTaskScheduler frameworkThreadTaskScheduler;
 
     private readonly ConcurrentDictionary<TaskCompletionSource, (ulong Expire, CancellationToken CancellationToken)>
@@ -53,21 +51,18 @@ internal sealed class Framework : IInternalDisposableService, IFramework
     [ServiceManager.ServiceConstructor]
     private unsafe Framework()
     {
-        this.hitchDetector = new HitchDetector("FrameworkUpdate", this.configuration.FrameworkUpdateHitch);
-
         this.frameworkDestroy = new();
+        this.frameworkDestroyed = new();
         this.frameworkThreadTaskScheduler = new();
         this.FrameworkThreadTaskFactory = new(
-            this.frameworkDestroy.Token,
+            this.frameworkDestroyed.Token,
             TaskCreationOptions.None,
             TaskContinuationOptions.None,
             this.frameworkThreadTaskScheduler);
 
         this.updateHook = Hook<CSFramework.Delegates.Tick>.FromAddress((nint)CSFramework.StaticVirtualTablePointer->Tick, this.HandleFrameworkUpdate);
-        this.destroyHook = Hook<CSFramework.Delegates.Destroy>.FromAddress((nint)CSFramework.StaticVirtualTablePointer->Destroy, this.HandleFrameworkDestroy);
 
         this.updateHook.Enable();
-        this.destroyHook.Enable();
     }
 
     /// <inheritdoc/>
@@ -109,6 +104,11 @@ internal sealed class Framework : IInternalDisposableService, IFramework
     internal List<string> NonUpdatedSubDelegates { get; private set; } = [];
 
     /// <summary>
+    /// Gets the dictionary of delegates and hitch log time.
+    /// </summary>
+    internal Dictionary<string, DateTime> HitchLogHistory { get; private set; } = [];
+
+    /// <summary>
     /// Gets or sets a value indicating whether to dispatch update events.
     /// </summary>
     internal bool DispatchUpdateEvents { get; set; } = true;
@@ -121,8 +121,9 @@ internal sealed class Framework : IInternalDisposableService, IFramework
     /// <inheritdoc/>
     public Task DelayTicks(long numTicks, CancellationToken cancellationToken = default)
     {
-        if (this.frameworkDestroy.IsCancellationRequested) // Going away
-            return Task.FromCanceled(this.frameworkDestroy.Token);
+        if (this.frameworkDestroyed.IsCancellationRequested) // Gone
+            return Task.FromCanceled(this.frameworkDestroyed.Token);
+
         if (numTicks <= 0 || this.frameworkThreadTaskScheduler.BoundThread == null) // Nonsense or before first tick
             return Task.CompletedTask;
 
@@ -165,12 +166,12 @@ internal sealed class Framework : IInternalDisposableService, IFramework
 
     /// <inheritdoc/>
     public Task<T> RunOnFrameworkThread<T>(Func<T> func) =>
-        this.IsInFrameworkUpdateThread || this.IsFrameworkUnloading ? Task.FromResult(func()) : this.RunOnTick(func);
+        this.IsInFrameworkUpdateThread || this.frameworkDestroyed.IsCancellationRequested ? Task.FromResult(func()) : this.RunOnTick(func);
 
     /// <inheritdoc/>
     public Task RunOnFrameworkThread(Action action)
     {
-        if (this.IsInFrameworkUpdateThread || this.IsFrameworkUnloading)
+        if (this.IsInFrameworkUpdateThread || this.frameworkDestroyed.IsCancellationRequested)
         {
             try
             {
@@ -190,23 +191,21 @@ internal sealed class Framework : IInternalDisposableService, IFramework
 
     /// <inheritdoc/>
     public Task<T> RunOnFrameworkThread<T>(Func<Task<T>> func) =>
-        this.IsInFrameworkUpdateThread || this.IsFrameworkUnloading ? func() : this.RunOnTick(func);
+        this.IsInFrameworkUpdateThread || this.frameworkDestroyed.IsCancellationRequested ? func() : this.RunOnTick(func);
 
     /// <inheritdoc/>
     public Task RunOnFrameworkThread(Func<Task> func) =>
-        this.IsInFrameworkUpdateThread || this.IsFrameworkUnloading ? func() : this.RunOnTick(func);
+        this.IsInFrameworkUpdateThread || this.frameworkDestroyed.IsCancellationRequested ? func() : this.RunOnTick(func);
 
     /// <inheritdoc/>
     public Task<T> RunOnTick<T>(Func<T> func, TimeSpan delay = default, int delayTicks = default, CancellationToken cancellationToken = default)
     {
-        if (this.IsFrameworkUnloading)
+        if (this.frameworkDestroyed.IsCancellationRequested)
         {
             if (delay == default && delayTicks == default)
                 return this.RunOnFrameworkThread(func);
 
-            var cts = new CancellationTokenSource();
-            cts.Cancel();
-            return Task.FromCanceled<T>(cts.Token);
+            return Task.FromCanceled<T>(this.frameworkDestroyed.Token);
         }
 
         if (cancellationToken == default)
@@ -225,14 +224,12 @@ internal sealed class Framework : IInternalDisposableService, IFramework
     /// <inheritdoc/>
     public Task RunOnTick(Action action, TimeSpan delay = default, int delayTicks = default, CancellationToken cancellationToken = default)
     {
-        if (this.IsFrameworkUnloading)
+        if (this.frameworkDestroyed.IsCancellationRequested)
         {
             if (delay == default && delayTicks == default)
                 return this.RunOnFrameworkThread(action);
 
-            var cts = new CancellationTokenSource();
-            cts.Cancel();
-            return Task.FromCanceled(cts.Token);
+            return Task.FromCanceled(this.frameworkDestroyed.Token);
         }
 
         if (cancellationToken == default)
@@ -251,14 +248,12 @@ internal sealed class Framework : IInternalDisposableService, IFramework
     /// <inheritdoc/>
     public Task<T> RunOnTick<T>(Func<Task<T>> func, TimeSpan delay = default, int delayTicks = default, CancellationToken cancellationToken = default)
     {
-        if (this.IsFrameworkUnloading)
+        if (this.frameworkDestroyed.IsCancellationRequested)
         {
             if (delay == default && delayTicks == default)
                 return this.RunOnFrameworkThread(func);
 
-            var cts = new CancellationTokenSource();
-            cts.Cancel();
-            return Task.FromCanceled<T>(cts.Token);
+            return Task.FromCanceled<T>(this.frameworkDestroyed.Token);
         }
 
         if (cancellationToken == default)
@@ -277,14 +272,12 @@ internal sealed class Framework : IInternalDisposableService, IFramework
     /// <inheritdoc/>
     public Task RunOnTick(Func<Task> func, TimeSpan delay = default, int delayTicks = default, CancellationToken cancellationToken = default)
     {
-        if (this.IsFrameworkUnloading)
+        if (this.frameworkDestroyed.IsCancellationRequested)
         {
             if (delay == default && delayTicks == default)
                 return this.RunOnFrameworkThread(func);
 
-            var cts = new CancellationTokenSource();
-            cts.Cancel();
-            return Task.FromCanceled(cts.Token);
+            return Task.FromCanceled(this.frameworkDestroyed.Token);
         }
 
         if (cancellationToken == default)
@@ -300,22 +293,23 @@ internal sealed class Framework : IInternalDisposableService, IFramework
             this.frameworkThreadTaskScheduler).Unwrap();
     }
 
+    /// <inheritdoc/>
+    public IDebouncer CreateDebouncer(TimeSpan delay, Action action)
+    {
+        return new Debouncer(this, delay, action);
+    }
+
     /// <summary>
     /// Dispose of managed and unmanaged resources.
     /// </summary>
     void IInternalDisposableService.DisposeService()
     {
-        this.RunOnFrameworkThread(() =>
-        {
-            // ReSharper disable once AccessToDisposedClosure
-            this.updateHook.Disable();
+        foreach (var k in this.tickDelayedTaskCompletionSources.Keys)
+            k.SetCanceled(this.frameworkDestroy.Token);
+        this.tickDelayedTaskCompletionSources.Clear();
 
-            // ReSharper disable once AccessToDisposedClosure
-            this.destroyHook.Disable();
-        }).Wait();
-
+        this.frameworkDestroyed.Cancel();
         this.updateHook.Dispose();
-        this.destroyHook.Dispose();
 
         this.updateStopwatch.Reset();
         StatsStopwatch.Reset();
@@ -340,43 +334,101 @@ internal sealed class Framework : IInternalDisposableService, IFramework
     }
 
     /// <summary>
+    /// Cancels CancellationTokenSources, sets GameLifecycle to shutting down and unloads Dalamud services.
+    /// </summary>
+    internal void UnloadDalamud()
+    {
+        if (this.frameworkDestroy.IsCancellationRequested)
+            return;
+
+        this.frameworkDestroy.Cancel();
+        this.DispatchUpdateEvents = false;
+
+        // All the same, for now...
+        this.lifecycle.SetShuttingDown();
+        this.lifecycle.SetUnloading();
+
+        Service<Dalamud>.Get().Unload();
+    }
+
+    /// <summary>
     /// Profiles each sub-delegate in the eventDelegate and logs to StatsHistory.
     /// </summary>
     /// <param name="eventDelegate">The Delegate to Profile.</param>
     /// <param name="frameworkInstance">The Framework Instance to pass to delegate.</param>
-    internal void ProfileAndInvoke(IFramework.OnUpdateDelegate? eventDelegate, IFramework frameworkInstance)
+    /// <param name="errorHandler">A function that is called with the exception, if one arrises.</param>
+    internal void ProfileAndInvoke(IFramework.OnUpdateDelegate? eventDelegate, IFramework frameworkInstance, Action<Exception, string>? errorHandler = null)
     {
         // Individually invoke OnUpdate handlers and time them.
         foreach (var d in Delegate.EnumerateInvocationList(eventDelegate))
         {
-            var stopwatch = Stopwatch.StartNew();
+            var isScopedService = d.Method.DeclaringType == typeof(FrameworkPluginScoped); // ignore FrameworkPluginScoped.OnUpdateForward itself
+            var startTime = Stopwatch.GetTimestamp();
+
             try
             {
                 d(frameworkInstance);
             }
             catch (Exception ex)
             {
-                Log.Error(ex, "Exception while dispatching Framework::Update event.");
+                if (errorHandler != null)
+                {
+                    errorHandler?.InvokeSafely(ex, GetFullHandlerName(d));
+                }
+                else if (!isScopedService)
+                {
+                    Log.Error(ex, "Exception while dispatching Framework::Update event.");
+                }
             }
 
-            stopwatch.Stop();
+            var elapsedMilliseconds = Stopwatch.GetElapsedTime(startTime).TotalMilliseconds;
 
-            var key = $"{d.Target}::{d.Method.Name}";
-            this.NonUpdatedSubDelegates.Remove(key);
+            if (!isScopedService && StatsEnabled)
+            {
+                var key = GetFullHandlerName(d);
+                this.NonUpdatedSubDelegates.Remove(key);
+                AddToStats(key, elapsedMilliseconds);
+            }
 
-            AddToStats(key, stopwatch.Elapsed.TotalMilliseconds);
+            if (!isScopedService && elapsedMilliseconds > this.configuration.FrameworkUpdateHitch)
+            {
+                var now = DateTime.UtcNow;
+                var cooldownTimeSpan = TimeSpan.FromSeconds(30);
+                var key = GetFullHandlerName(d);
+
+                var hasCooldown = this.HitchLogHistory.TryGetValue(key, out var lastLogTimestamp);
+                if (!hasCooldown || (hasCooldown && now - lastLogTimestamp > cooldownTimeSpan))
+                {
+                    this.HitchLogHistory[key] = now;
+                    Serilog.Log.Warning("[HITCH] Long {Name} detected, {Total}ms > {Max}ms", key, elapsedMilliseconds, this.configuration.FrameworkUpdateHitch);
+                }
+
+                // Clean up old entries in HitchLogHistory
+                var threshold = now - cooldownTimeSpan;
+                foreach (var rmKey in this.HitchLogHistory.Where(kvp => kvp.Value < threshold).Select(kvp => kvp.Key).ToArray())
+                {
+                    this.HitchLogHistory.Remove(rmKey);
+                }
+            }
         }
+
+        static string GetFullHandlerName(IFramework.OnUpdateDelegate d) => $"{d.Target}::{d.Method.Name}";
     }
 
     private unsafe bool HandleFrameworkUpdate(CSFramework* thisPtr)
+    {
+        this.RunFrameworkTick();
+
+        return this.updateHook.OriginalDisposeSafe(thisPtr);
+    }
+
+    private unsafe void RunFrameworkTick()
     {
         this.frameworkThreadTaskScheduler.BoundThread ??= Thread.CurrentThread;
 
         ThreadSafety.MarkMainThread();
 
-        this.hitchDetector.Start();
-
-        this.BeforeUpdate?.InvokeSafely(this);
+        this.ProfileAndInvoke(this.BeforeUpdate, this);
 
         try
         {
@@ -387,47 +439,52 @@ internal sealed class Framework : IInternalDisposableService, IFramework
             Log.Error(ex, "Exception in DalamudConfiguration.Update.");
         }
 
+        this.updateStopwatch.Stop();
+        this.UpdateDelta = TimeSpan.FromMilliseconds(this.updateStopwatch.ElapsedMilliseconds);
+        this.updateStopwatch.Restart();
+
+        this.LastUpdate = DateTime.Now;
+        this.LastUpdateUTC = DateTime.UtcNow;
+        this.tickCounter++;
+        foreach (var (k, (expiry, ct)) in this.tickDelayedTaskCompletionSources)
+        {
+            if (ct.IsCancellationRequested)
+                k.SetCanceled(ct);
+            else if (expiry <= this.tickCounter)
+                k.SetResult();
+            else
+                continue;
+
+            this.tickDelayedTaskCompletionSources.Remove(k, out _);
+        }
+
+        if (StatsEnabled)
+        {
+            StatsStopwatch.Restart();
+            this.frameworkThreadTaskScheduler.Run();
+            StatsStopwatch.Stop();
+
+            AddToStats(nameof(this.frameworkThreadTaskScheduler), StatsStopwatch.Elapsed.TotalMilliseconds);
+        }
+        else
+        {
+            this.frameworkThreadTaskScheduler.Run();
+        }
+
+        // Only call Update as long as we're in the actual Framework loop
         if (this.DispatchUpdateEvents)
         {
-            this.updateStopwatch.Stop();
-            this.UpdateDelta = TimeSpan.FromMilliseconds(this.updateStopwatch.ElapsedMilliseconds);
-            this.updateStopwatch.Restart();
-
-            this.LastUpdate = DateTime.Now;
-            this.LastUpdateUTC = DateTime.UtcNow;
-            this.tickCounter++;
-            foreach (var (k, (expiry, ct)) in this.tickDelayedTaskCompletionSources)
-            {
-                if (ct.IsCancellationRequested)
-                    k.SetCanceled(ct);
-                else if (expiry <= this.tickCounter)
-                    k.SetResult();
-                else
-                    continue;
-
-                this.tickDelayedTaskCompletionSources.Remove(k, out _);
-            }
-
+            // Stat Tracking for Framework Updates
             if (StatsEnabled)
             {
-                StatsStopwatch.Restart();
-                this.frameworkThreadTaskScheduler.Run();
-                StatsStopwatch.Stop();
-
-                AddToStats(nameof(this.frameworkThreadTaskScheduler), StatsStopwatch.Elapsed.TotalMilliseconds);
-            }
-            else
-            {
-                this.frameworkThreadTaskScheduler.Run();
-            }
-
-            if (StatsEnabled && this.Update != null)
-            {
-                // Stat Tracking for Framework Updates
                 this.NonUpdatedSubDelegates = StatsHistory.Keys.ToList();
-                this.ProfileAndInvoke(this.Update, this);
+            }
 
-                // Cleanup handlers that are no longer being called
+            this.ProfileAndInvoke(this.Update, this);
+
+            // Cleanup handlers that are no longer being called
+            if (StatsEnabled)
+            {
                 foreach (var key in this.NonUpdatedSubDelegates)
                 {
                     if (key == nameof(this.FrameworkThreadTaskFactory))
@@ -443,36 +500,7 @@ internal sealed class Framework : IInternalDisposableService, IFramework
                     }
                 }
             }
-            else
-            {
-                this.Update?.InvokeSafely(this);
-            }
         }
-
-        this.hitchDetector.Stop();
-
-        return this.updateHook.OriginalDisposeSafe(thisPtr);
-    }
-
-    private unsafe bool HandleFrameworkDestroy(CSFramework* thisPtr)
-    {
-        this.frameworkDestroy.Cancel();
-        this.DispatchUpdateEvents = false;
-        foreach (var k in this.tickDelayedTaskCompletionSources.Keys)
-            k.SetCanceled(this.frameworkDestroy.Token);
-        this.tickDelayedTaskCompletionSources.Clear();
-
-        // All the same, for now...
-        this.lifecycle.SetShuttingDown();
-        this.lifecycle.SetUnloading();
-
-        Log.Information("Framework::Destroy!");
-        Service<Dalamud>.Get().Unload();
-        this.frameworkThreadTaskScheduler.Run();
-        ServiceManager.WaitForServiceUnload();
-        Log.Information("Framework::Destroy OK!");
-
-        return this.destroyHook.OriginalDisposeSafe(thisPtr);
     }
 }
 
@@ -486,6 +514,7 @@ internal sealed class Framework : IInternalDisposableService, IFramework
 #pragma warning restore SA1015
 internal class FrameworkPluginScoped : IInternalDisposableService, IFramework
 {
+    private readonly LocalPlugin plugin;
     private readonly PluginErrorHandler pluginErrorHandler;
 
     [ServiceManager.ServiceDependency]
@@ -494,10 +523,13 @@ internal class FrameworkPluginScoped : IInternalDisposableService, IFramework
     /// <summary>
     /// Initializes a new instance of the <see cref="FrameworkPluginScoped"/> class.
     /// </summary>
+    /// <param name="plugin">The plugin.</param>
     /// <param name="pluginErrorHandler">Error handler instance.</param>
-    internal FrameworkPluginScoped(PluginErrorHandler pluginErrorHandler)
+    internal FrameworkPluginScoped(LocalPlugin plugin, PluginErrorHandler pluginErrorHandler)
     {
+        this.plugin = plugin;
         this.pluginErrorHandler = pluginErrorHandler;
+
         this.frameworkService.Update += this.OnUpdateForward;
     }
 
@@ -582,15 +614,16 @@ internal class FrameworkPluginScoped : IInternalDisposableService, IFramework
     public Task RunOnTick(Func<Task> func, TimeSpan delay = default, int delayTicks = default, CancellationToken cancellationToken = default)
         => this.frameworkService.RunOnTick(func, delay, delayTicks, cancellationToken);
 
+    /// <inheritdoc/>
+    public IDebouncer CreateDebouncer(TimeSpan delay, Action action)
+        => this.frameworkService.CreateDebouncer(delay, action);
+
     private void OnUpdateForward(IFramework framework)
     {
-        if (Framework.StatsEnabled && this.Update != null)
+        this.frameworkService.ProfileAndInvoke(this.Update, this, (ex, handlerName) =>
         {
-            this.frameworkService.ProfileAndInvoke(this.Update, framework);
-        }
-        else
-        {
-            this.pluginErrorHandler.InvokeAndCatch(this.Update, $"{nameof(IFramework)}::{nameof(IFramework.Update)}", framework);
-        }
+            Serilog.Log.Error(ex, $"[{this.plugin.InternalName}] Exception in event handler {{EventHandlerName}}", handlerName);
+            this.pluginErrorHandler.NotifyError();
+        });
     }
 }

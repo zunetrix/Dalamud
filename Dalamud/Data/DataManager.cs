@@ -5,6 +5,7 @@ using System.Threading.Tasks;
 using Dalamud.Game;
 using Dalamud.IoC;
 using Dalamud.IoC.Internal;
+using Dalamud.Logging.Internal;
 using Dalamud.Plugin.Services;
 using Dalamud.Utility;
 using Dalamud.Utility.Timing;
@@ -14,8 +15,6 @@ using Lumina.Data;
 using Lumina.Excel;
 
 using Newtonsoft.Json;
-
-using Serilog;
 
 namespace Dalamud.Data;
 
@@ -29,6 +28,8 @@ namespace Dalamud.Data;
 #pragma warning restore SA1015
 internal sealed class DataManager : IInternalDisposableService, IDataManager
 {
+    private static readonly ModuleLog Log = ModuleLog.Create<DataManager>();
+
     private readonly Thread luminaResourceThread;
     private readonly CancellationTokenSource luminaCancellationTokenSource;
     private readonly RsvResolver rsvResolver;
@@ -42,7 +43,7 @@ internal sealed class DataManager : IInternalDisposableService, IDataManager
 
         try
         {
-            Log.Verbose("Starting data load...");
+            Log.Verbose("Initializing Lumina...");
 
             using (Timings.Start("Lumina Init"))
             {
@@ -102,8 +103,6 @@ internal sealed class DataManager : IInternalDisposableService, IDataManager
                 }
             }
 
-            this.IsDataReady = true;
-
             this.luminaCancellationTokenSource = new();
 
             var luminaCancellationToken = this.luminaCancellationTokenSource.Token;
@@ -141,11 +140,6 @@ internal sealed class DataManager : IInternalDisposableService, IDataManager
 
     /// <inheritdoc/>
     public bool HasModifiedGameDataFiles { get; private set; }
-
-    /// <summary>
-    /// Gets a value indicating whether Game Data is ready to be read.
-    /// </summary>
-    internal bool IsDataReady { get; private set; }
 
     #region Lumina Wrappers
 

@@ -611,8 +611,8 @@ internal partial class InterfaceManager : IInternalDisposableService
         if (CSFramework.Instance()->GetNetworkModuleProxy() == null)
             return;
 
-        this.SetupHooks(Service<TargetSigScanner>.Get(), Service<FontAtlasFactory>.Get());
         this.framework.Update -= this.FrameworkOnUpdate;
+        this.SetupHooks(Service<TargetSigScanner>.Get(), Service<FontAtlasFactory>.Get());
     }
 
     /// <summary>Checks if the provided swap chain is the target that Dalamud should draw its interface onto,
@@ -737,7 +737,7 @@ internal partial class InterfaceManager : IInternalDisposableService
             if (configuration.SavedStyles == null ||
                 configuration.SavedStyles.All(x => x.Name != builtInStyles[0].Name))
             {
-                configuration.SavedStyles = [..builtInStyles];
+                configuration.SavedStyles = [.. builtInStyles];
                 configuration.ChosenStyle = builtInStyles[0].Name;
             }
 
@@ -1177,9 +1177,7 @@ internal partial class InterfaceManager : IInternalDisposableService
             && gamepadState.Raw(GamepadButtons.L1) > 0
             && gamepadState.Pressed(GamepadButtons.L3) > 0)
         {
-            io.ConfigFlags ^= ImGuiConfigFlags.NavEnableGamepad;
-            gamepadState.NavEnableGamepad ^= true;
-            dalamudInterface.ToggleGamepadModeNotifierWindow();
+            gamepadState.EnableGamepadNav ^= true;
         }
 
         if (gamepadEnabled && (io.ConfigFlags & ImGuiConfigFlags.NavEnableGamepad) > 0)
@@ -1231,6 +1229,9 @@ internal partial class InterfaceManager : IInternalDisposableService
 
     private void Display()
     {
+        if (this.framework.IsFrameworkUnloading)
+            return;
+
         // this is more or less part of what reshade/etc do to avoid having to manually
         // set the cursor inside the ui
         // This will just tell ImGui to draw its own software cursor instead of using the hardware cursor

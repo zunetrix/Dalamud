@@ -120,12 +120,8 @@ internal class PluginManager : IInternalDisposableService
         this.PluginConfigs = new PluginConfigurations(Path.Combine(Path.GetDirectoryName(this.dalamud.StartInfo.ConfigurationPath) ?? string.Empty, "pluginConfigs"));
 
         var bannedPluginsJson = File.ReadAllText(Path.Combine(this.dalamud.StartInfo.AssetDirectory!, "UIRes", "bannedplugin.json"));
-        this.bannedPlugins = JsonConvert.DeserializeObject<BannedPlugin[]>(bannedPluginsJson);
-        if (this.bannedPlugins == null)
-        {
-            throw new InvalidDataException("Couldn't deserialize banned plugins manifest.");
-        }
-
+        this.bannedPlugins = JsonConvert.DeserializeObject<BannedPlugin[]>(bannedPluginsJson)
+            ?? throw new InvalidDataException("Couldn't deserialize banned plugins manifest.");
         this.openInstallerWindowPluginChangelogsLink =
             Service<ChatGui>.GetAsync().ContinueWith(
                 chatGuiTask => chatGuiTask.Result.AddChatLinkHandler(
@@ -316,7 +312,7 @@ internal class PluginManager : IInternalDisposableService
                     {
                         if (metadata.Status == PluginUpdateStatus.StatusKind.Success)
                         {
-                            chatGui.Print(Locs.DalamudPluginUpdateSuccessful(metadata.Name, metadata.Version));
+                            chatGui.Print(Locs.DalamudPluginUpdateSuccessful(metadata.AffectedPlugin.Name, metadata.AffectedPlugin.Version));
                         }
                         else
                         {
@@ -324,8 +320,8 @@ internal class PluginManager : IInternalDisposableService
                                 new XivChatEntry
                                 {
                                     Message = Locs.DalamudPluginUpdateFailed(
-                                        metadata.Name,
-                                        metadata.Version,
+                                        metadata.AffectedPlugin.Name,
+                                        metadata.AffectedPlugin.Version,
                                         PluginUpdateStatus.LocalizeUpdateStatusKind(metadata.Status)),
                                     Type = XivChatType.Urgent,
                                 });
@@ -375,42 +371,47 @@ internal class PluginManager : IInternalDisposableService
     /// <inheritdoc/>
     void IInternalDisposableService.DisposeService()
     {
-        DisposeAsync(
-            this.installedPluginsList
+        this.UnloadAllPlugins().Wait();
+    }
+
+    /// <summary>
+    /// Unloads all loaded plugins.
+    /// </summary>
+    /// <returns>Task that will resolve once all plugins are unloaded.</returns>
+    public async Task UnloadAllPlugins()
+    {
+        var disposablePlugins = this.installedPluginsList
                 .Where(plugin => plugin.State is PluginState.Loaded or PluginState.LoadError)
-                .ToArray(),
-            this.configuration).Wait();
-        return;
+                .ToArray();
 
-        static async Task DisposeAsync(LocalPlugin[] disposablePlugins, DalamudConfiguration configuration)
-        {
-            if (disposablePlugins.Length == 0)
-                return;
+        if (disposablePlugins.Length == 0)
+            return;
 
-            // Any unload/dispose operation called from this function log errors on their own.
-            // Ignore all errors.
+        Log.Information("==== UNLOADING ALL PLUGINS ====");
 
-            // Unload plugins that requires to be unloaded synchronously,
-            // just in case some plugin codes are still running via callbacks initiated externally.
-            foreach (var plugin in disposablePlugins.Where(plugin => !plugin.Manifest.CanUnloadAsync))
-                await plugin.UnloadAsync(PluginLoaderDisposalMode.None).SuppressException();
+        // Any unload/dispose operation called from this function log errors on their own.
+        // Ignore all errors.
 
-            // Unload plugins that can be unloaded from any thread.
-            await Task.WhenAll(
-                          disposablePlugins.Where(plugin => plugin.Manifest.CanUnloadAsync)
-                                           .Select(plugin => plugin.UnloadAsync(PluginLoaderDisposalMode.None)))
-                      .SuppressException();
+        // Unload plugins that requires to be unloaded synchronously,
+        // just in case some plugin codes are still running via callbacks initiated externally.
+        foreach (var plugin in disposablePlugins.Where(plugin => !plugin.Manifest.CanUnloadAsync))
+            await plugin.UnloadAsync(PluginLoaderDisposalMode.None).SuppressException();
 
-            // Just in case plugins still have tasks running that they didn't cancel when they should have,
-            // give them some time to complete it.
-            // This helps avoid plugins being reloaded from conflicting with itself of previous instance.
-            await Task.Delay(configuration.PluginWaitBeforeFree ?? PluginWaitBeforeFreeDefault);
+        // Unload plugins that can be unloaded from any thread.
+        await Task.WhenAll(
+                      disposablePlugins.Where(plugin => plugin.Manifest.CanUnloadAsync)
+                                       .Select(plugin => plugin.UnloadAsync(PluginLoaderDisposalMode.None)))
+                  .SuppressException();
 
-            // Now that we've waited enough, dispose the whole plugin.
-            // Since plugins should have been unloaded above, this should complete quickly.
-            await Task.WhenAll(disposablePlugins.Select(plugin => plugin.DisposeAsync().AsTask()))
-                      .SuppressException();
-        }
+        // Just in case plugins still have tasks running that they didn't cancel when they should have,
+        // give them some time to complete it.
+        // This helps avoid plugins being reloaded from conflicting with itself of previous instance.
+        await Task.Delay(this.configuration.PluginWaitBeforeFree ?? PluginWaitBeforeFreeDefault);
+
+        // Now that we've waited enough, dispose the whole plugin.
+        // Since plugins should have been unloaded above, this should complete quickly.
+        await Task.WhenAll(disposablePlugins.Select(plugin => plugin.DisposeAsync().AsTask()))
+                  .SuppressException();
     }
 
     /// <summary>
@@ -969,7 +970,7 @@ internal class PluginManager : IInternalDisposableService
         this.NotifyInstalledPluginsChanged();
         this.NotifyPluginsForStateChange(
             autoUpdate ? PluginListInvalidationKind.AutoUpdate : PluginListInvalidationKind.Update,
-            updatedList.Select(x => x.InternalName));
+            updatedList.Select(x => x.AffectedPlugin));
 
         Log.Information("Plugin update OK. {UpdateCount} plugins updated", updatedList.Length);
 
@@ -1008,13 +1009,10 @@ internal class PluginManager : IInternalDisposableService
         if (workingPluginId == Guid.Empty)
             throw new Exception("Existing plugin had no WorkingPluginId");
 
+        var version = metadata.UseTesting ? metadata.UpdateManifest.TestingAssemblyVersion : metadata.UpdateManifest.AssemblyVersion;
         var updateStatus = new PluginUpdateStatus
         {
-            InternalName = plugin.Manifest.InternalName,
-            Name = plugin.Manifest.Name,
-            Version = (metadata.UseTesting
-                           ? metadata.UpdateManifest.TestingAssemblyVersion
-                           : metadata.UpdateManifest.AssemblyVersion)!,
+            AffectedPlugin = new ActivePluginsChangedEventArgs.AffectedPlugin(plugin, version),
             Status = PluginUpdateStatus.StatusKind.Success,
             HasChangelog = !metadata.UpdateManifest.Changelog.IsNullOrWhitespace(),
         };
@@ -1223,8 +1221,8 @@ internal class PluginManager : IInternalDisposableService
     /// Notifies all plugins that the active plugins list changed.
     /// </summary>
     /// <param name="kind">The invalidation kind.</param>
-    /// <param name="affectedInternalNames">The affected plugins.</param>
-    public void NotifyPluginsForStateChange(PluginListInvalidationKind kind, IEnumerable<string> affectedInternalNames)
+    /// <param name="affectedPlugins">The affected plugins.</param>
+    public void NotifyPluginsForStateChange(PluginListInvalidationKind kind, IEnumerable<IActivePluginsChangedEventArgs.IAffectedPlugin> affectedPlugins)
     {
         using (this.pluginListLock.EnterScope())
         {
@@ -1233,8 +1231,7 @@ internal class PluginManager : IInternalDisposableService
                 if (!installedPlugin.IsLoaded || installedPlugin.DalamudInterface == null)
                     continue;
 
-                installedPlugin.DalamudInterface.NotifyActivePluginsChanged(
-                    new ActivePluginsChangedEventArgs(kind, affectedInternalNames));
+                installedPlugin.DalamudInterface.NotifyActivePluginsChanged(new ActivePluginsChangedEventArgs(kind, affectedPlugins));
             }
         }
     }
